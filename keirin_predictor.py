@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -272,45 +272,9 @@ def _resolve_venue_id(race_name: str) -> Tuple[int, str]:
     raise ValueError("unknown venue")
 
 
-def _parse_line_groups(text: str) -> List[LineInfo]:
-    """Parse line text such as '5-2-9 / 1-7-4' into LineInfo objects."""
-
-    groups: List[LineInfo] = []
-    for block in text.split("/"):
-        members = [int(part) for part in re.findall(r"\d+", block)]
-        if members:
-            groups.append(LineInfo(members=members))
-    return groups
-
-
 def _extract_lines(soup: BeautifulSoup) -> List[LineInfo]:
     """Extract line formation information from soup."""
 
-    keyword = re.compile(r"(並び|並び予想|周回予想|想定並び)")
-    for tag in soup.find_all(string=keyword):
-        parent = tag.parent
-        if parent is not None:
-            text = parent.get_text(" ", strip=True)
-            match = LINE_PATTERN.search(text)
-            if match:
-                groups = _parse_line_groups(match.group())
-                if groups:
-                    return groups
-        match = LINE_PATTERN.search(str(tag))
-        if match:
-            groups = _parse_line_groups(match.group())
-            if groups:
-                return groups
-        if parent is not None:
-            sibling = parent.find_next(string=LINE_PATTERN)
-            if sibling:
-                match_next = LINE_PATTERN.search(str(sibling))
-                if match_next:
-                    groups = _parse_line_groups(match_next.group())
-                    if groups:
-                        return groups
-
-    # Fall back to scanning any text for the pattern.
     seen: set[str] = set()
     for text in soup.stripped_strings:
         match = LINE_PATTERN.search(text)
@@ -320,7 +284,11 @@ def _extract_lines(soup: BeautifulSoup) -> List[LineInfo]:
         if candidate in seen:
             continue
         seen.add(candidate)
-        groups = _parse_line_groups(candidate)
+        groups = []
+        for block in candidate.split("/"):
+            members = [int(part) for part in re.findall(r"\d+", block)]
+            if members:
+                groups.append(LineInfo(members=members))
         if groups:
             return groups
     return []
@@ -337,109 +305,76 @@ def _ensure_rider(riders: Dict[int, RiderRaw], number: int) -> RiderRaw:
 def _extract_riders(soup: BeautifulSoup) -> Dict[int, RiderRaw]:
     """Extract rider information from race detail page."""
 
-    tables = soup.find_all("table")
-    target_table = None
-    headers: List[str] = []
-    want_keys = ("枠番", "車番", "選手")
-
-    for table in tables:
-        th_cells = table.find_all("th")
-        if not th_cells:
-            continue
-        header_texts = [th.get_text(strip=True) for th in th_cells]
-        joined = " ".join(header_texts)
-        if all(key in joined for key in want_keys):
-            target_table = table
-            headers = header_texts
-            break
-
-    if target_table is None:
-        raise ValueError("failed to parse riders: table with headers not found")
-
-    normalized_headers = [_normalize_text(h) for h in headers]
-
-    def header_index(keyword: str) -> int:
-        for idx, header in enumerate(headers):
-            if keyword in header:
-                return idx
-        return -1
-
-    car_idx = header_index("車番")
-    if car_idx < 0:
-        car_idx = header_index("枠番")
-    name_idx = header_index("選手")
-    if name_idx < 0:
-        name_idx = header_index("氏名")
-    if car_idx < 0 or name_idx < 0:
-        raise ValueError("failed to parse riders: missing required columns")
-
     riders: Dict[int, RiderRaw] = {}
-    for row in target_table.find_all("tr"):
-        cells = row.find_all("td")
-        if not cells:
+    for table in soup.find_all("table"):
+        header_row = None
+        for row in table.find_all("tr"):
+            th_cells = row.find_all("th")
+            if th_cells:
+                header_row = th_cells
+                break
+        if header_row is None:
             continue
-        if car_idx >= len(cells) or name_idx >= len(cells):
+        headers = [th.get_text(strip=True) for th in header_row]
+        normalized_headers = [_normalize_text(h) for h in headers]
+        if not any("車" in h or "枠" in h for h in normalized_headers):
             continue
-        car_text = cells[car_idx].get_text(" ", strip=True)
-        numbers = [int(n) for n in re.findall(r"\d+", car_text)]
-        if not numbers:
-            continue
-        number = numbers[0]
-        rider = _ensure_rider(riders, number)
-        name_text = cells[name_idx].get_text(" ", strip=True)
-        if name_text:
-            rider.name = name_text.split()[0]
-        for idx, header in enumerate(normalized_headers):
-            if idx >= len(cells):
+        rows = table.find_all("tr")
+        for row in rows:
+            cells = row.find_all(["td", "th"])
+            if not cells:
                 continue
-            value = cells[idx].get_text(" ", strip=True)
-            if not value:
+            raw_text = [cell.get_text(" ", strip=True) for cell in cells]
+            numbers = [int(n) for n in re.findall(r"\d+", raw_text[0])]
+            if not numbers:
                 continue
-            if "競走得点" in header or "得点" in header:
-                parsed = _parse_float(value)
-                rider.score = parsed if parsed is not None else rider.score
-            elif "直近" in header or "最近" in header:
-                rider.recent_results = _parse_recent_results(value)
-            elif "3連対" in header:
-                rider.recent_top3_rate = _parse_percentage(value)
-            elif "脚質" in header:
-                rider.style = value
-            elif "スタート" in header or "ダッシュ" in header:
-                parsed = _parse_float(value)
-                rider.start_response = parsed if parsed is not None else rider.start_response
-            elif "位置" in header:
-                parsed = _parse_float(value)
-                rider.position_score = parsed if parsed is not None else rider.position_score
-            elif "地元" in header or "相性" in header:
-                parsed = _parse_float(value)
-                rider.local_factor = parsed if parsed is not None else rider.local_factor
-            elif "自力" in header:
-                parsed = _parse_float(value)
-                rider.self_strength = parsed if parsed is not None else rider.self_strength
-            elif "先行力" in header:
-                parsed = _parse_float(value)
-                rider.lead_power = parsed if parsed is not None else rider.lead_power
-            elif "番手" in header:
-                parsed = _parse_float(value)
-                rider.second_power = parsed if parsed is not None else rider.second_power
-            elif "三番手" in header:
-                parsed = _parse_float(value)
-                rider.third_stability = parsed if parsed is not None else rider.third_stability
-            elif "バンク" in header:
-                parsed = _parse_float(value)
-                rider.bank_suitability = parsed if parsed is not None else rider.bank_suitability
-            elif "風" in header and "耐" in header:
-                parsed = _parse_float(value)
-                rider.wind_resistance = parsed if parsed is not None else rider.wind_resistance
-            elif "風" in header and "影響" in header:
-                parsed = _parse_float(value)
-                rider.wind_penalty = parsed if parsed is not None else rider.wind_penalty
-
-    numbers = sorted(riders)
-    if len(numbers) < 7 or not all(1 <= n <= 9 for n in numbers):
-        raise ValueError(f"failed to parse riders: invalid field count {numbers}")
-
-    return {num: riders[num] for num in sorted(riders)}
+            number = numbers[0]
+            rider = _ensure_rider(riders, number)
+            for header, value in zip(normalized_headers, raw_text):
+                if not value:
+                    continue
+                if "選手" in header or "氏名" in header:
+                    rider.name = value.split()[0]
+                elif "競走得点" in header or "得点" in header:
+                    parsed = _parse_float(value)
+                    rider.score = parsed if parsed is not None else rider.score
+                elif "直近" in header or "最近" in header:
+                    rider.recent_results = _parse_recent_results(value)
+                elif "3連対" in header:
+                    rider.recent_top3_rate = _parse_percentage(value)
+                elif "脚質" in header:
+                    rider.style = value
+                elif "スタート" in header or "ダッシュ" in header:
+                    parsed = _parse_float(value)
+                    rider.start_response = parsed if parsed is not None else rider.start_response
+                elif "位置" in header:
+                    parsed = _parse_float(value)
+                    rider.position_score = parsed if parsed is not None else rider.position_score
+                elif "地元" in header or "相性" in header:
+                    parsed = _parse_float(value)
+                    rider.local_factor = parsed if parsed is not None else rider.local_factor
+                elif "自力" in header:
+                    parsed = _parse_float(value)
+                    rider.self_strength = parsed if parsed is not None else rider.self_strength
+                elif "先行力" in header:
+                    parsed = _parse_float(value)
+                    rider.lead_power = parsed if parsed is not None else rider.lead_power
+                elif "番手" in header:
+                    parsed = _parse_float(value)
+                    rider.second_power = parsed if parsed is not None else rider.second_power
+                elif "三番手" in header:
+                    parsed = _parse_float(value)
+                    rider.third_stability = parsed if parsed is not None else rider.third_stability
+                elif "バンク" in header:
+                    parsed = _parse_float(value)
+                    rider.bank_suitability = parsed if parsed is not None else rider.bank_suitability
+                elif "風" in header and "耐" in header:
+                    parsed = _parse_float(value)
+                    rider.wind_resistance = parsed if parsed is not None else rider.wind_resistance
+                elif "風" in header and "影響" in header:
+                    parsed = _parse_float(value)
+                    rider.wind_penalty = parsed if parsed is not None else rider.wind_penalty
+    return riders
 
 
 def _extract_trifecta_odds(html: str) -> Dict[Tuple[int, int, int], float]:
@@ -447,55 +382,56 @@ def _extract_trifecta_odds(html: str) -> Dict[Tuple[int, int, int], float]:
 
     soup = BeautifulSoup(html, "lxml")
     odds: Dict[Tuple[int, int, int], float] = {}
-
-    def collect_from_table(table: Tag) -> None:
-        nonlocal odds
-        for row in table.find_all("tr"):
-            cells = row.find_all("td")
+    target_table = None
+    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "div"]):
+        if "3連単" in heading.get_text(strip=True):
+            target_table = heading.find_next("table")
+            if target_table:
+                break
+    if target_table is None:
+        tables = soup.find_all("table")
+        for table in tables:
+            header_text = " ".join(th.get_text(strip=True) for th in table.find_all("th"))
+            if "3連単" in header_text or "組番" in header_text:
+                target_table = table
+                break
+    if target_table:
+        for row in target_table.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in row.find_all(["th", "td"])]
             if len(cells) < 2:
                 continue
-            combo_text = cells[0].get_text(" ", strip=True)
-            if not re.fullmatch(r"\d-\d-\d", combo_text):
-                match = re.search(r"\d(?:-\d+){2}", combo_text)
-                combo_text = match.group() if match else ""
+            combo_text = None
+            for cell in cells:
+                match = re.search(r"\d(?:-\d+){2}", cell)
+                if match:
+                    combo_text = match.group()
+                    break
             if not combo_text:
                 continue
-            odds_text = cells[1].get_text(" ", strip=True)
-            odds_value = _parse_float(odds_text)
+            odds_value = None
+            for cell in cells[1:]:
+                parsed = _parse_float(cell)
+                if parsed is not None:
+                    odds_value = parsed
+                    break
             if odds_value is None:
                 continue
             numbers = tuple(int(part) for part in combo_text.split("-"))
             if len(numbers) == 3:
                 odds[numbers] = odds_value
-
-    headings = soup.find_all(lambda tag: tag.name in ("h1", "h2", "h3", "h4") and "3連単" in tag.get_text(strip=True))
-    for heading in headings:
-        for sibling in heading.find_all_next(["table", "h1", "h2", "h3", "h4"], limit=10):
-            if sibling.name == "table":
-                collect_from_table(sibling)
-            else:
-                break
-        if odds:
-            break
-
-    if not odds:
-        for table in soup.find_all("table"):
-            header_text = " ".join(th.get_text(strip=True) for th in table.find_all("th"))
-            if "3連単" in header_text or "組番" in header_text:
-                collect_from_table(table)
-        if not odds:
-            matches = re.finditer(r"(\d(?:-\d+){2})" r"\D+([0-9]+\.?[0-9]*)", soup.get_text(" ", strip=True))
-            for match in matches:
-                combo_text = match.group(1)
-                odds_text = match.group(2)
-                numbers = tuple(int(part) for part in combo_text.split("-"))
-                if len(numbers) != 3:
-                    continue
-                odds_value = _parse_float(odds_text)
-                if odds_value is None:
-                    continue
-                odds.setdefault(numbers, odds_value)
-
+    if odds:
+        return odds
+    matches = re.finditer(r"(\d(?:-\d+){2})"r"\D+([0-9]+\.?[0-9]*)", soup.get_text(" ", strip=True))
+    for match in matches:
+        combo_text = match.group(1)
+        odds_text = match.group(2)
+        numbers = tuple(int(part) for part in combo_text.split("-"))
+        if len(numbers) != 3:
+            continue
+        odds_value = _parse_float(odds_text)
+        if odds_value is None:
+            continue
+        odds.setdefault(numbers, odds_value)
     return odds
 
 
