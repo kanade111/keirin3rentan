@@ -9,30 +9,33 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 )
 DEFAULT_HEADERS = {
     "User-Agent": USER_AGENT,
-    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-    "Referer": "https://www.chariloto.com/",
+    "Accept-Language": "ja,en;q=0.9",
+    "Referer": "https://keirin.kdreams.jp/",
 }
 REQUEST_TIMEOUT = 15
 REQUEST_RETRIES = 3
 REQUEST_BACKOFF = 1.5
 
-CHARILOTO_BASE = "https://www.chariloto.com"
+GAMBOO_ROOT = "https://keirin.kdreams.jp/"
+GAMBOO_BASE = "https://keirin.kdreams.jp/gamboo/keirin-kaisai/race-card"
+_GAMBOO_ODDS_CACHE: Dict[Tuple[str, str, str], str] = {}
 VENUE_MAP_RAW: Dict[str, int] = {
     # 北日本
     "函館": 11,
@@ -272,28 +275,6 @@ def _resolve_venue_id(race_name: str) -> Tuple[int, str]:
     raise ValueError("unknown venue")
 
 
-def _extract_lines(soup: BeautifulSoup) -> List[LineInfo]:
-    """Extract line formation information from soup."""
-
-    seen: set[str] = set()
-    for text in soup.stripped_strings:
-        match = LINE_PATTERN.search(text)
-        if not match:
-            continue
-        candidate = match.group()
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        groups = []
-        for block in candidate.split("/"):
-            members = [int(part) for part in re.findall(r"\d+", block)]
-            if members:
-                groups.append(LineInfo(members=members))
-        if groups:
-            return groups
-    return []
-
-
 def _ensure_rider(riders: Dict[int, RiderRaw], number: int) -> RiderRaw:
     """Ensure a RiderRaw entry exists for given number."""
 
@@ -302,175 +283,343 @@ def _ensure_rider(riders: Dict[int, RiderRaw], number: int) -> RiderRaw:
     return riders[number]
 
 
-def _extract_riders(soup: BeautifulSoup) -> Dict[int, RiderRaw]:
-    """Extract rider information from race detail page."""
+def _parse_line_groups(text: str) -> List[LineInfo]:
+    """Parse line text such as '5-2-9 / 1-7-4' into LineInfo objects."""
+
+    groups: List[LineInfo] = []
+    for block in text.split("/"):
+        members = [int(part) for part in re.findall(r"\d+", block)]
+        if members:
+            groups.append(LineInfo(members=members))
+    return groups
+
+
+def _is_lead_role(role: str) -> bool:
+    """Return True if the role indicates the start of a new line group."""
+
+    if not role:
+        return False
+    role = role.strip()
+    if any(keyword in role for keyword in ("先行", "自在")):
+        return True
+    if "先" in role and any(keyword in role for keyword in ("押", "抑", "突", "逃")):
+        return True
+    if any(keyword in role for keyword in ("逃", "主導", "カマ")):
+        return True
+    return False
+
+
+def _pairs_from_line_text(text: str) -> List[Tuple[int, str]]:
+    """Extract (number, role) pairs from a free-form line description."""
+
+    tokens = re.split(r"\s+", text)
+    pairs: List[Tuple[int, str]] = []
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx].strip("←:：")
+        if not token:
+            idx += 1
+            continue
+        if token.isdigit():
+            number = int(token)
+            role = ""
+            lookahead = idx + 1
+            while lookahead < len(tokens):
+                candidate = tokens[lookahead].strip("←:：")
+                if not candidate:
+                    lookahead += 1
+                    continue
+                if candidate.isdigit():
+                    break
+                if re.fullmatch(r"[\d-]+", candidate):
+                    break
+                role = candidate
+                lookahead += 1
+                break
+            pairs.append((number, role))
+            idx = max(lookahead, idx + 1)
+        else:
+            idx += 1
+    return pairs
+
+
+def _build_line_groups(pairs: Sequence[Tuple[int, str]]) -> List[LineInfo]:
+    """Build line groups from (number, role) pairs."""
+
+    groups: List[LineInfo] = []
+    current: List[int] = []
+    for number, role in pairs:
+        if not current:
+            current = [number]
+            continue
+        if _is_lead_role(role):
+            groups.append(LineInfo(members=current))
+            current = [number]
+        else:
+            current.append(number)
+    if current:
+        groups.append(LineInfo(members=current))
+    return [group for group in groups if group.members]
+
+
+def parse_lines_from_gamboo(html: str) -> List[LineInfo]:
+    """Parse line formations from GAMBOO "並び予想" content."""
+
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "lxml")
+    candidates: List[str] = []
+    keyword = re.compile(r"並び予想")
+    for tag in soup.find_all(string=keyword):
+        if isinstance(tag, str):
+            candidates.append(tag)
+        parent = tag.parent
+        if parent is not None:
+            candidates.append(parent.get_text(" ", strip=True))
+            sibling = parent.find_next(string=True)
+            if sibling:
+                candidates.append(str(sibling))
+    candidates.append(soup.get_text(" ", strip=True))
+
+    seen: set[str] = set()
+    for text in candidates:
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        pairs = _pairs_from_line_text(text)
+        groups = _build_line_groups(pairs)
+        if groups:
+            return groups
+        match = LINE_PATTERN.search(text)
+        if match:
+            groups = _parse_line_groups(match.group())
+            if groups:
+                return groups
+    return []
+
+
+def parse_riders_from_gamboo(html: str) -> Dict[int, RiderRaw]:
+    """Extract rider information from GAMBOO odds page HTML."""
+
+    soup = BeautifulSoup(html, "lxml")
+    tables = soup.find_all("table")
+    target_table: Optional[Tag] = None
+    headers: List[str] = []
+    want_keys = ("枠番", "車番", "選手")
+
+    for table in tables:
+        th_cells = table.find_all("th")
+        if not th_cells:
+            continue
+        header_texts = [th.get_text(strip=True) for th in th_cells]
+        joined = " ".join(header_texts)
+        if all(key in joined for key in want_keys) or "出走表" in joined:
+            target_table = table
+            headers = header_texts
+            break
+
+    if target_table is None:
+        raise ValueError("failed to parse riders: table with headers not found")
+
+    normalized_headers = [_normalize_text(h) for h in headers]
+
+    def header_index(keyword: str) -> int:
+        for idx, header in enumerate(headers):
+            if keyword in header:
+                return idx
+        return -1
+
+    car_idx = header_index("車番")
+    if car_idx < 0:
+        car_idx = header_index("枠番")
+    name_idx = header_index("選手")
+    if name_idx < 0:
+        name_idx = header_index("氏名")
+    if car_idx < 0 or name_idx < 0:
+        raise ValueError("failed to parse riders: missing required columns")
 
     riders: Dict[int, RiderRaw] = {}
-    for table in soup.find_all("table"):
-        header_row = None
-        for row in table.find_all("tr"):
-            th_cells = row.find_all("th")
-            if th_cells:
-                header_row = th_cells
-                break
-        if header_row is None:
+    for row in target_table.find_all("tr"):
+        cells = row.find_all("td")
+        if not cells:
             continue
-        headers = [th.get_text(strip=True) for th in header_row]
-        normalized_headers = [_normalize_text(h) for h in headers]
-        if not any("車" in h or "枠" in h for h in normalized_headers):
+        if car_idx >= len(cells) or name_idx >= len(cells):
             continue
-        rows = table.find_all("tr")
-        for row in rows:
-            cells = row.find_all(["td", "th"])
-            if not cells:
+        car_text = cells[car_idx].get_text(" ", strip=True)
+        numbers = [int(n) for n in re.findall(r"\d+", car_text)]
+        if not numbers:
+            continue
+        number = numbers[0]
+        rider = _ensure_rider(riders, number)
+        name_text = cells[name_idx].get_text(" ", strip=True)
+        if name_text:
+            rider.name = name_text.split()[0]
+        for idx, header in enumerate(normalized_headers):
+            if idx >= len(cells):
                 continue
-            raw_text = [cell.get_text(" ", strip=True) for cell in cells]
-            numbers = [int(n) for n in re.findall(r"\d+", raw_text[0])]
-            if not numbers:
+            value = cells[idx].get_text(" ", strip=True)
+            if not value:
                 continue
-            number = numbers[0]
-            rider = _ensure_rider(riders, number)
-            for header, value in zip(normalized_headers, raw_text):
-                if not value:
-                    continue
-                if "選手" in header or "氏名" in header:
-                    rider.name = value.split()[0]
-                elif "競走得点" in header or "得点" in header:
-                    parsed = _parse_float(value)
-                    rider.score = parsed if parsed is not None else rider.score
-                elif "直近" in header or "最近" in header:
-                    rider.recent_results = _parse_recent_results(value)
-                elif "3連対" in header:
-                    rider.recent_top3_rate = _parse_percentage(value)
-                elif "脚質" in header:
-                    rider.style = value
-                elif "スタート" in header or "ダッシュ" in header:
-                    parsed = _parse_float(value)
-                    rider.start_response = parsed if parsed is not None else rider.start_response
-                elif "位置" in header:
-                    parsed = _parse_float(value)
-                    rider.position_score = parsed if parsed is not None else rider.position_score
-                elif "地元" in header or "相性" in header:
-                    parsed = _parse_float(value)
-                    rider.local_factor = parsed if parsed is not None else rider.local_factor
-                elif "自力" in header:
-                    parsed = _parse_float(value)
-                    rider.self_strength = parsed if parsed is not None else rider.self_strength
-                elif "先行力" in header:
-                    parsed = _parse_float(value)
-                    rider.lead_power = parsed if parsed is not None else rider.lead_power
-                elif "番手" in header:
-                    parsed = _parse_float(value)
-                    rider.second_power = parsed if parsed is not None else rider.second_power
-                elif "三番手" in header:
-                    parsed = _parse_float(value)
-                    rider.third_stability = parsed if parsed is not None else rider.third_stability
-                elif "バンク" in header:
-                    parsed = _parse_float(value)
-                    rider.bank_suitability = parsed if parsed is not None else rider.bank_suitability
-                elif "風" in header and "耐" in header:
-                    parsed = _parse_float(value)
-                    rider.wind_resistance = parsed if parsed is not None else rider.wind_resistance
-                elif "風" in header and "影響" in header:
-                    parsed = _parse_float(value)
-                    rider.wind_penalty = parsed if parsed is not None else rider.wind_penalty
-    return riders
+            if "競走得点" in header or "得点" in header:
+                parsed = _parse_float(value)
+                rider.score = parsed if parsed is not None else rider.score
+            elif "直近" in header or "最近" in header:
+                rider.recent_results = _parse_recent_results(value)
+            elif "3連対" in header:
+                rider.recent_top3_rate = _parse_percentage(value)
+            elif "脚質" in header:
+                rider.style = value
+            elif "スタート" in header or "ダッシュ" in header:
+                parsed = _parse_float(value)
+                rider.start_response = parsed if parsed is not None else rider.start_response
+            elif "位置" in header:
+                parsed = _parse_float(value)
+                rider.position_score = parsed if parsed is not None else rider.position_score
+            elif "地元" in header or "相性" in header:
+                parsed = _parse_float(value)
+                rider.local_factor = parsed if parsed is not None else rider.local_factor
+            elif "自力" in header:
+                parsed = _parse_float(value)
+                rider.self_strength = parsed if parsed is not None else rider.self_strength
+            elif "先行力" in header:
+                parsed = _parse_float(value)
+                rider.lead_power = parsed if parsed is not None else rider.lead_power
+            elif "番手" in header:
+                parsed = _parse_float(value)
+                rider.second_power = parsed if parsed is not None else rider.second_power
+            elif "三番手" in header:
+                parsed = _parse_float(value)
+                rider.third_stability = parsed if parsed is not None else rider.third_stability
+            elif "バンク" in header:
+                parsed = _parse_float(value)
+                rider.bank_suitability = parsed if parsed is not None else rider.bank_suitability
+            elif "風" in header and "耐" in header:
+                parsed = _parse_float(value)
+                rider.wind_resistance = parsed if parsed is not None else rider.wind_resistance
+            elif "風" in header and "影響" in header:
+                parsed = _parse_float(value)
+                rider.wind_penalty = parsed if parsed is not None else rider.wind_penalty
+
+    numbers = sorted(riders)
+    if len(numbers) < 7 or not all(1 <= n <= 9 for n in numbers):
+        raise ValueError(f"failed to parse riders: invalid field count {numbers}")
+
+    return {num: riders[num] for num in sorted(riders)}
 
 
-def _extract_trifecta_odds(html: str) -> Dict[Tuple[int, int, int], float]:
-    """Extract trifecta odds from odds page HTML."""
+def parse_trifecta_odds_from_gamboo(html: str) -> Dict[Tuple[int, int, int], float]:
+    """Extract trifecta odds from GAMBOO odds page HTML."""
 
     soup = BeautifulSoup(html, "lxml")
     odds: Dict[Tuple[int, int, int], float] = {}
-    target_table = None
-    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "div"]):
-        if "3連単" in heading.get_text(strip=True):
-            target_table = heading.find_next("table")
-            if target_table:
-                break
-    if target_table is None:
-        tables = soup.find_all("table")
-        for table in tables:
-            header_text = " ".join(th.get_text(strip=True) for th in table.find_all("th"))
-            if "3連単" in header_text or "組番" in header_text:
-                target_table = table
-                break
-    if target_table:
-        for row in target_table.find_all("tr"):
-            cells = [c.get_text(" ", strip=True) for c in row.find_all(["th", "td"])]
+
+    def collect_from_table(table: Tag) -> None:
+        nonlocal odds
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
             if len(cells) < 2:
                 continue
-            combo_text = None
-            for cell in cells:
-                match = re.search(r"\d(?:-\d+){2}", cell)
-                if match:
-                    combo_text = match.group()
-                    break
+            combo_text = cells[0].get_text(" ", strip=True)
+            if not re.fullmatch(r"\d-\d-\d", combo_text):
+                match = re.search(r"\d(?:-\d+){2}", combo_text)
+                combo_text = match.group() if match else ""
             if not combo_text:
                 continue
-            odds_value = None
-            for cell in cells[1:]:
-                parsed = _parse_float(cell)
-                if parsed is not None:
-                    odds_value = parsed
-                    break
+            odds_text = cells[1].get_text(" ", strip=True)
+            odds_value = _parse_float(odds_text)
             if odds_value is None:
                 continue
             numbers = tuple(int(part) for part in combo_text.split("-"))
             if len(numbers) == 3:
                 odds[numbers] = odds_value
-    if odds:
-        return odds
-    matches = re.finditer(r"(\d(?:-\d+){2})"r"\D+([0-9]+\.?[0-9]*)", soup.get_text(" ", strip=True))
-    for match in matches:
-        combo_text = match.group(1)
-        odds_text = match.group(2)
-        numbers = tuple(int(part) for part in combo_text.split("-"))
-        if len(numbers) != 3:
-            continue
-        odds_value = _parse_float(odds_text)
-        if odds_value is None:
-            continue
-        odds.setdefault(numbers, odds_value)
+
+    headings = soup.find_all(lambda tag: tag.name in ("h1", "h2", "h3", "h4") and "3連単" in tag.get_text(strip=True))
+    for heading in headings:
+        for sibling in heading.find_all_next(["table", "h1", "h2", "h3", "h4"], limit=10):
+            if sibling.name == "table":
+                collect_from_table(sibling)
+            else:
+                break
+        if odds:
+            break
+
+    if not odds:
+        for table in soup.find_all("table"):
+            header_text = " ".join(th.get_text(strip=True) for th in table.find_all("th"))
+            if "3連単" in header_text or "組番" in header_text:
+                collect_from_table(table)
+        if not odds:
+            matches = re.finditer(r"(\d(?:-\d+){2})" r"\D+([0-9]+\.?[0-9]*)", soup.get_text(" ", strip=True))
+            for match in matches:
+                combo_text = match.group(1)
+                odds_text = match.group(2)
+                numbers = tuple(int(part) for part in combo_text.split("-"))
+                if len(numbers) != 3:
+                    continue
+                odds_value = _parse_float(odds_text)
+                if odds_value is None:
+                    continue
+                odds.setdefault(numbers, odds_value)
+
     return odds
 
 
-def _extract_bank_and_wind(soup: BeautifulSoup) -> Tuple[Optional[int], Optional[Dict[str, object]]]:
-    """Extract bank length and wind information if present."""
+def build_gamboo_ids(venue_id: int, target_date: date, race_no: int) -> Tuple[str, str, str]:
+    """Resolve GAMBOO identifiers (A, B, RR) by probing possible start dates."""
 
-    text = soup.get_text(" ", strip=True)
-    bank_length: Optional[int] = None
-    bank_match = re.search(r"(33[3]?|400|500)\s*m", text)
-    if bank_match:
+    last_error: Optional[Exception] = None
+    rr = f"{race_no:02d}"
+    for delta in range(0, 7):
+        start_date = target_date - timedelta(days=delta)
+        day_code = f"{delta + 1:02d}"
+        a_value = f"{venue_id:02d}{start_date:%Y%m%d}"
+        b_value = f"{a_value}{day_code}00"
+        odds_url = f"{GAMBOO_BASE}/odds/{a_value}/{b_value}/{rr}/3rentan/"
         try:
-            bank_length = int(bank_match.group(1))
-        except ValueError:
-            bank_length = None
-    wind_speed = None
-    wind_dir = None
-    speed_match = re.search(r"風速[：: ]*([0-9]+\.?[0-9]*)", text)
-    if speed_match:
-        wind_speed = _parse_float(speed_match.group(1))
-    dir_match = re.search(r"風向[：: ]*([東西南北]+)", text)
-    if dir_match:
-        wind_dir = dir_match.group(1)
-    wind_info = None
-    if wind_speed is not None or wind_dir:
-        wind_info = {"direction": wind_dir, "speed": float(wind_speed or 0.0)}
-    return bank_length, wind_info
+            response = _request_with_retry(odds_url, referer=GAMBOO_ROOT)
+            response.encoding = response.apparent_encoding or response.encoding or "utf-8"
+            text = response.text
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            continue
+        marker_text = text.replace("\u3000", " ")
+        if "3連単" in marker_text or "出走表" in marker_text:
+            _GAMBOO_ODDS_CACHE[(a_value, b_value, rr)] = text
+            return a_value, b_value, rr
+        last_error = RuntimeError("content missing trifecta markers")
+    raise RuntimeError("failed to resolve GAMBOO ids") from last_error
+
+
+def fetch_gamboo_pages(a_value: str, b_value: str, rr: str) -> Tuple[str, str]:
+    """Fetch odds and forecast pages for resolved identifiers."""
+
+    odds_url = f"{GAMBOO_BASE}/odds/{a_value}/{b_value}/{rr}/3rentan/"
+    cache_key = (a_value, b_value, rr)
+    odds_html = _GAMBOO_ODDS_CACHE.pop(cache_key, None)
+    if odds_html is None:
+        response = _request_with_retry(odds_url, referer=GAMBOO_ROOT)
+        response.encoding = response.apparent_encoding or response.encoding or "utf-8"
+        odds_html = response.text
+
+    yoso_url = f"{GAMBOO_BASE}/yoso/{a_value}/{b_value}/{rr}/3rentan/"
+    try:
+        response_yoso = _request_with_retry(yoso_url, referer=odds_url)
+        response_yoso.encoding = response_yoso.apparent_encoding or response_yoso.encoding or "utf-8"
+        yoso_html = response_yoso.text
+    except Exception:  # noqa: BLE001
+        yoso_html = ""
+
+    return odds_html, yoso_html
 # ---------------------------------------------------------------------------
 # Fetching and parsing
 # ---------------------------------------------------------------------------
 
 
 def fetch_race_data(date_str: str, race_name: str) -> Dict:
-    """Fetch race metadata, riders, lineups, and odds."""
+    """Fetch race metadata, riders, lineups, and odds from GAMBOO."""
 
     try:
-        date_digits = date_str.replace("-", "")
-        if len(date_digits) != 8:
-            raise ValueError
-        int(date_digits)
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError as exc:
         raise ValueError("Invalid date format; expected YYYY-MM-DD") from exc
 
@@ -495,24 +644,14 @@ def fetch_race_data(date_str: str, race_name: str) -> Dict:
     else:
         meta["venue"] = venue_key
 
-    detail_url = f"{CHARILOTO_BASE}/keirin/athletes/{date_str}/{venue_id}/{race_no}"
-    detail_resp = _request_with_retry(detail_url, referer=CHARILOTO_BASE + "/")
-    detail_resp.encoding = detail_resp.apparent_encoding or detail_resp.encoding or "utf-8"
-    detail_html = detail_resp.text
-    detail_soup = BeautifulSoup(detail_html, "lxml")
+    a_value, b_value, rr = build_gamboo_ids(venue_id, date_obj, race_no)
+    odds_html, yoso_html = fetch_gamboo_pages(a_value, b_value, rr)
 
-    riders = _extract_riders(detail_soup)
+    riders = parse_riders_from_gamboo(odds_html)
     if not riders:
-        raise ValueError("failed to parse riders from detail page")
+        raise ValueError("failed to parse riders from GAMBOO page")
 
-    lines = _extract_lines(detail_soup)
-    bank_length, wind_info = _extract_bank_and_wind(detail_soup)
-
-    odds_url = f"{detail_url}?odds=1"
-    odds_resp = _request_with_retry(odds_url, referer=detail_url)
-    odds_resp.encoding = odds_resp.apparent_encoding or odds_resp.encoding or "utf-8"
-    odds_html = odds_resp.text
-    odds = _extract_trifecta_odds(odds_html)
+    odds = parse_trifecta_odds_from_gamboo(odds_html)
     if not odds:
         raise ValueError("Threefold odds not available")
     rider_count = len(riders)
@@ -521,15 +660,26 @@ def fetch_race_data(date_str: str, race_name: str) -> Dict:
         if len(odds) < expected_combos:
             raise ValueError("Threefold odds not available")
 
-    meta["detail_url"] = detail_url
-    meta["odds_url"] = odds_url
+    lines = parse_lines_from_gamboo(yoso_html)
+    if not lines:
+        lines = parse_lines_from_gamboo(odds_html)
+
+    odds_url = f"{GAMBOO_BASE}/odds/{a_value}/{b_value}/{rr}/3rentan/"
+    yoso_url = f"{GAMBOO_BASE}/yoso/{a_value}/{b_value}/{rr}/3rentan/"
+    meta.update({
+        "a_code": a_value,
+        "b_code": b_value,
+        "rr": rr,
+        "odds_url": odds_url,
+        "yoso_url": yoso_url,
+    })
 
     return {
         "riders": riders,
         "lines": lines,
         "odds": odds,
-        "bank_length": bank_length,
-        "wind": wind_info,
+        "bank_length": None,
+        "wind": None,
         "meta": meta,
     }
 
